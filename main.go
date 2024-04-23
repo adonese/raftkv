@@ -1,520 +1,271 @@
 package main
 
 import (
-	"bufio"
+	"encoding/json"
+	"flag"
 	"fmt"
+	"io"
 	"log"
-	"math/rand"
 	"net"
-	"net/rpc"
+	"net/http"
 	"os"
-	"strings"
+	"path"
 	"sync"
 	"time"
+
+	"github.com/hashicorp/raft"
+	raftboltdb "github.com/hashicorp/raft-boltdb"
 )
 
-const (
-	ElectionTimeout   = 150 * time.Millisecond
-	HeartbeatInterval = 50 * time.Millisecond
-)
-
-type State int
-
-const (
-	Follower State = iota
-	Candidate
-	Leader
-)
-
-type LogEntry struct {
-	Term    int
-	Command string
+type kvFsm struct {
+	db *sync.Map
 }
 
-type KVStore struct {
-	mu   sync.Mutex
-	data map[string]string
+type httpServer struct {
+	r  *raft.Raft
+	db *sync.Map
 }
 
-func (kv *KVStore) Set(key, value string) {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-	kv.data[key] = value
+type setPayload struct {
+	Key   string
+	Value string
 }
 
-func (kv *KVStore) Get(key string) (string, bool) {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
-	value, ok := kv.data[key]
-	return value, ok
-}
+func (kf *kvFsm) Apply(log *raft.Log) any {
+	switch log.Type {
+	case raft.LogCommand:
+		var sp setPayload
+		err := json.Unmarshal(log.Data, &sp)
+		if err != nil {
+			return fmt.Errorf("Could not parse payload: %s", err)
+		}
 
-type RaftNode struct {
-	mu             sync.Mutex
-	id             int
-	currentTerm    int
-	votedFor       int
-	log            []LogEntry
-	commitIndex    int
-	lastApplied    int
-	state          State
-	electionTimer  *time.Timer
-	heartbeatTimer *time.Timer
-	votes          int
-	peers          []string
-	store          *KVStore
-	applyCh        chan LogEntry
-	shutdown       chan struct{}
-}
-
-type RequestVoteArgs struct {
-	Term         int
-	CandidateID  int
-	LastLogIndex int
-	LastLogTerm  int
-}
-
-type RequestVoteReply struct {
-	Term        int
-	VoteGranted bool
-}
-
-type AppendEntriesArgs struct {
-	Term         int
-	LeaderID     int
-	PrevLogIndex int
-	PrevLogTerm  int
-	Entries      []LogEntry
-	LeaderCommit int
-}
-
-type AppendEntriesReply struct {
-	Term    int
-	Success bool
-}
-
-func (rn *RaftNode) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) error {
-	rn.mu.Lock()
-	defer rn.mu.Unlock()
-
-	if args.Term < rn.currentTerm {
-		reply.Term = rn.currentTerm
-		reply.VoteGranted = false
-		return nil
+		kf.db.Store(sp.Key, sp.Value)
+	default:
+		return fmt.Errorf("Unknown raft log type: %#v", log.Type)
 	}
 
-	if args.Term > rn.currentTerm {
-		rn.becomeFollower(args.Term)
-	}
-
-	if rn.votedFor == -1 || rn.votedFor == args.CandidateID {
-		reply.VoteGranted = true
-		rn.votedFor = args.CandidateID
-		rn.electionTimer.Reset(ElectionTimeout)
-	}
-
-	reply.Term = rn.currentTerm
 	return nil
 }
 
-func (rn *RaftNode) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) error {
-	rn.mu.Lock()
-	defer rn.mu.Unlock()
+func (kf *kvFsm) Restore(rc io.ReadCloser) error {
+	// Must always restore from a clean state!!
+	kf.db.Range(func(key any, _ any) bool {
+		kf.db.Delete(key)
+		return true
+	})
 
-	if args.Term < rn.currentTerm {
-		reply.Term = rn.currentTerm
-		reply.Success = false
-		return nil
-	}
+	decoder := json.NewDecoder(rc)
 
-	if args.Term > rn.currentTerm {
-		rn.becomeFollower(args.Term)
-	}
-
-	rn.electionTimer.Reset(ElectionTimeout)
-
-	if args.PrevLogIndex >= 0 && (args.PrevLogIndex >= len(rn.log) || rn.log[args.PrevLogIndex].Term != args.PrevLogTerm) {
-		reply.Success = false
-		return nil
-	}
-
-	rn.log = rn.log[:args.PrevLogIndex+1]
-	rn.log = append(rn.log, args.Entries...)
-
-	if args.LeaderCommit > rn.commitIndex {
-		rn.commitIndex = min(args.LeaderCommit, len(rn.log)-1)
-	}
-
-	reply.Term = rn.currentTerm
-	reply.Success = true
-	return nil
-}
-
-func (rn *RaftNode) broadcastRequestVote() {
-	lastLogIndex := len(rn.log) - 1
-	lastLogTerm := 0
-	if lastLogIndex >= 0 {
-		lastLogTerm = rn.log[lastLogIndex].Term
-	}
-
-	args := &RequestVoteArgs{
-		Term:         rn.currentTerm,
-		CandidateID:  rn.id,
-		LastLogIndex: lastLogIndex,
-		LastLogTerm:  lastLogTerm,
-	}
-
-	for _, peer := range rn.peers {
-		go func(peer string) {
-			reply := &RequestVoteReply{}
-			client, err := rpc.Dial("tcp", peer)
-			if err != nil {
-				return
-			}
-			defer client.Close()
-
-			client.Call("RaftNode.RequestVote", args, reply)
-			rn.mu.Lock()
-			defer rn.mu.Unlock()
-
-			if reply.Term > rn.currentTerm {
-				rn.becomeFollower(reply.Term)
-				return
-			}
-
-			if reply.VoteGranted {
-				rn.votes++
-				if rn.state == Candidate && rn.votes > len(rn.peers)/2 {
-					rn.becomeLeader()
-				}
-			}
-		}(peer)
-	}
-}
-
-func (rn *RaftNode) sendHeartbeats() {
-	for {
-		select {
-		case <-rn.heartbeatTimer.C:
-			rn.mu.Lock()
-			if rn.state != Leader {
-				rn.mu.Unlock()
-				return
-			}
-
-			prevLogIndex := len(rn.log) - 1
-			prevLogTerm := 0
-			if prevLogIndex >= 0 {
-				prevLogTerm = rn.log[prevLogIndex].Term
-			}
-
-			args := &AppendEntriesArgs{
-				Term:         rn.currentTerm,
-				LeaderID:     rn.id,
-				PrevLogIndex: prevLogIndex,
-				PrevLogTerm:  prevLogTerm,
-				Entries:      []LogEntry{},
-				LeaderCommit: rn.commitIndex,
-			}
-			rn.mu.Unlock()
-
-			for _, peer := range rn.peers {
-				go func(peer string) {
-					reply := &AppendEntriesReply{}
-					client, err := rpc.Dial("tcp", peer)
-					if err != nil {
-						return
-					}
-					defer client.Close()
-
-					client.Call("RaftNode.AppendEntries", args, reply)
-					rn.mu.Lock()
-					defer rn.mu.Unlock()
-
-					if reply.Term > rn.currentTerm {
-						rn.becomeFollower(reply.Term)
-						return
-					}
-				}(peer)
-			}
-		case <-rn.shutdown:
-			return
+	for decoder.More() {
+		var sp setPayload
+		err := decoder.Decode(&sp)
+		if err != nil {
+			return fmt.Errorf("Could not decode payload: %s", err)
 		}
+
+		kf.db.Store(sp.Key, sp.Value)
 	}
+
+	return rc.Close()
 }
 
-func (rn *RaftNode) runElectionTimer() {
-	for {
-		select {
-		case <-rn.electionTimer.C:
-			rn.mu.Lock()
-			if rn.state == Follower {
-				rn.becomeCandidate()
-			}
-			rn.mu.Unlock()
-		case <-rn.shutdown:
-			return
-		}
-	}
+type snapshotNoop struct{}
+
+func (sn snapshotNoop) Persist(_ raft.SnapshotSink) error { return nil }
+func (sn snapshotNoop) Release()                          {}
+
+func (kf *kvFsm) Snapshot() (raft.FSMSnapshot, error) {
+	return snapshotNoop{}, nil
 }
 
-func (rn *RaftNode) start() {
-	rpc.Register(rn)
-	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", 1234+rn.id))
+func setupRaft(dir, nodeId, raftAddress string, kf *kvFsm) (*raft.Raft, error) {
+	os.MkdirAll(dir, os.ModePerm)
+
+	store, err := raftboltdb.NewBoltStore(path.Join(dir, "bolt"))
 	if err != nil {
-		log.Fatal(err)
+		return nil, fmt.Errorf("Could not create bolt store: %s", err)
 	}
-	go rpc.Accept(ln)
 
-	rn.electionTimer = time.NewTimer(ElectionTimeout)
-	go rn.runElectionTimer()
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
+	snapshots, err := raft.NewFileSnapshotStore(path.Join(dir, "snapshot"), 2, os.Stderr)
+	if err != nil {
+		return nil, fmt.Errorf("Could not create snapshot store: %s", err)
 	}
-	return b
-}
 
-func (rn *RaftNode) logger(format string, args ...interface{}) {
-	fmt.Printf("[Node %d] %s\n", rn.id, fmt.Sprintf(format, args...))
-}
-
-func (rn *RaftNode) becomeFollower(term int) {
-	rn.currentTerm = term
-	rn.votedFor = -1
-	rn.state = Follower
-	rn.electionTimer.Reset(ElectionTimeout)
-	rn.logger("Became follower in term %d", term)
-}
-
-func (rn *RaftNode) becomeCandidate() {
-	rn.currentTerm++
-	rn.votedFor = rn.id
-	rn.state = Candidate
-	rn.votes = 1
-	rn.broadcastRequestVote()
-	rn.electionTimer.Reset(ElectionTimeout)
-	rn.logger("Became candidate in term %d", rn.currentTerm)
-}
-
-func (rn *RaftNode) becomeLeader() {
-	rn.state = Leader
-	rn.heartbeatTimer = time.NewTimer(HeartbeatInterval)
-	go rn.sendHeartbeats()
-	rn.logger("Became leader in term %d", rn.currentTerm)
-}
-
-func (rn *RaftNode) applyCommand(command string) {
-	parts := strings.Split(command, " ")
-	if len(parts) == 3 && parts[0] == "set" {
-		rn.store.Set(parts[1], parts[2])
-		rn.logger("Applied command: %s", command)
+	tcpAddr, err := net.ResolveTCPAddr("tcp", raftAddress)
+	if err != nil {
+		return nil, fmt.Errorf("Could not resolve address: %s", err)
 	}
-}
 
-func (rn *RaftNode) startApplier() {
-	for {
-		select {
-		case entry := <-rn.applyCh:
-			rn.mu.Lock()
-			if rn.state == Leader {
-				rn.log = append(rn.log, entry)
-				rn.mu.Unlock()
-				rn.replicateLog(entry)
-			} else {
-				rn.mu.Unlock()
-			}
-		case <-rn.shutdown:
-			return
-		}
+	transport, err := raft.NewTCPTransport(raftAddress, tcpAddr, 10, time.Second*10, os.Stderr)
+	if err != nil {
+		return nil, fmt.Errorf("Could not create tcp transport: %s", err)
 	}
+
+	raftCfg := raft.DefaultConfig()
+	raftCfg.LocalID = raft.ServerID(nodeId)
+
+	r, err := raft.NewRaft(raftCfg, kf, store, store, snapshots, transport)
+	if err != nil {
+		return nil, fmt.Errorf("Could not create raft instance: %s", err)
+	}
+
+	// Cluster consists of unjoined leaders. Picking a leader and
+	// creating a real cluster is done manually after startup.
+	r.BootstrapCluster(raft.Configuration{
+		Servers: []raft.Server{
+			{
+				ID:      raft.ServerID(nodeId),
+				Address: transport.LocalAddr(),
+			},
+		},
+	})
+
+	return r, nil
 }
 
-func (rn *RaftNode) replicateLog(entry LogEntry) {
-	rn.mu.Lock()
-	if rn.state != Leader {
-		rn.mu.Unlock()
+func (hs httpServer) joinHandler(w http.ResponseWriter, r *http.Request) {
+	followerId := r.URL.Query().Get("followerId")
+	followerAddr := r.URL.Query().Get("followerAddr")
+
+	if hs.r.State() != raft.Leader {
+		json.NewEncoder(w).Encode(struct {
+			Error string `json:"error"`
+		}{
+			"Not the leader",
+		})
+		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 		return
 	}
-	prevLogIndex := len(rn.log) - 2
-	prevLogTerm := 0
-	if prevLogIndex >= 0 {
-		prevLogTerm = rn.log[prevLogIndex].Term
-	}
-	currentTerm := rn.currentTerm
-	commitIndex := rn.commitIndex
-	rn.mu.Unlock()
 
-	var wg sync.WaitGroup
-	majority := len(rn.peers)/2 + 1
-	successCount := 1
-
-	for _, peer := range rn.peers {
-		wg.Add(1)
-		go func(peer string) {
-			defer wg.Done()
-			args := &AppendEntriesArgs{
-				Term:         currentTerm,
-				LeaderID:     rn.id,
-				PrevLogIndex: prevLogIndex,
-				PrevLogTerm:  prevLogTerm,
-				Entries:      []LogEntry{entry},
-				LeaderCommit: commitIndex,
-			}
-
-			reply := &AppendEntriesReply{}
-			client, err := rpc.Dial("tcp", peer)
-			if err != nil {
-				return
-			}
-			defer client.Close()
-
-			client.Call("RaftNode.AppendEntries", args, reply)
-			rn.mu.Lock()
-			defer rn.mu.Unlock()
-
-			if reply.Term > currentTerm {
-				rn.becomeFollower(reply.Term)
-				return
-			}
-
-			if reply.Success {
-				successCount++
-				if successCount >= majority && rn.state == Leader {
-					rn.commitIndex = len(rn.log) - 1
-					rn.lastApplied = rn.commitIndex
-					go rn.applyCommittedLogs()
-				}
-			}
-		}(peer)
+	err := hs.r.AddVoter(raft.ServerID(followerId), raft.ServerAddress(followerAddr), 0, 0).Error()
+	if err != nil {
+		log.Printf("Failed to add follower: %s", err)
+		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 	}
 
-	wg.Wait()
+	w.WriteHeader(http.StatusOK)
 }
 
-func (rn *RaftNode) startClient() {
-	reader := bufio.NewReader(os.Stdin)
-	for {
-		fmt.Printf("[Node %d] Enter a command (set <key> <value>) or 'crash' to crash the leader: ", rn.id)
-		input, _ := reader.ReadString('\n')
-		input = strings.TrimSpace(input)
+func (hs httpServer) setHandler(w http.ResponseWriter, r *http.Request) {
+	defer r.Body.Close()
+	bs, err := io.ReadAll(r.Body)
+	if err != nil {
+		log.Printf("Could not read key-value in http request: %s", err)
+		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+		return
+	}
 
-		if input == "quit" {
-			fmt.Printf("[Node %d] Shutting down\n", rn.id)
-			close(rn.shutdown)
-			return
-		}
+	future := hs.r.Apply(bs, 500*time.Millisecond)
 
-		if input == "crash" {
-			rn.mu.Lock()
-			if rn.state == Leader {
-				rn.crash()
-			} else {
-				fmt.Printf("[Node %d] Cannot crash. Not the leader.\n", rn.id)
-			}
-			rn.mu.Unlock()
+	// Blocks until completion
+	if err := future.Error(); err != nil {
+		log.Printf("Could not write key-value: %s", err)
+		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+		return
+	}
+
+	e := future.Response()
+	if e != nil {
+		log.Printf("Could not write key-value, application: %s", e)
+		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
+		return
+	}
+
+	w.WriteHeader(http.StatusOK)
+}
+
+func (hs httpServer) getHandler(w http.ResponseWriter, r *http.Request) {
+	key := r.URL.Query().Get("key")
+	value, _ := hs.db.Load(key)
+	if value == nil {
+		value = ""
+	}
+
+	rsp := struct {
+		Data string `json:"data"`
+	}{value.(string)}
+	err := json.NewEncoder(w).Encode(rsp)
+	if err != nil {
+		log.Printf("Could not encode key-value in http response: %s", err)
+		http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+	}
+}
+
+type config struct {
+	id       string
+	httpPort string
+	raftPort string
+}
+
+func getConfig() config {
+	cfg := config{}
+	for i, arg := range os.Args[1:] {
+		if arg == "--node-id" {
+			cfg.id = os.Args[i+2]
+			i++
 			continue
 		}
 
-		rn.mu.Lock()
-		if rn.state == Leader {
-			entry := LogEntry{Term: rn.currentTerm, Command: input}
-			rn.log = append(rn.log, entry)
-			rn.mu.Unlock()
-			go rn.replicateLog(entry)
-			fmt.Printf("[Node %d] Appended command to log: %s\n", rn.id, input)
-		} else {
-			rn.mu.Unlock()
-			fmt.Printf("[Node %d] Not the leader. Cannot process command.\n", rn.id)
+		if arg == "--http-port" {
+			cfg.httpPort = os.Args[i+2]
+			i++
+			continue
+		}
+
+		if arg == "--raft-port" {
+			cfg.raftPort = os.Args[i+2]
+			i++
+			continue
 		}
 	}
-}
 
-func (rn *RaftNode) redirectToLeader(leaderID int, command string) {
-	leaderAddr := rn.peers[leaderID]
-	client, err := rpc.Dial("tcp", leaderAddr)
-	if err != nil {
-		fmt.Printf("[Node %d] Failed to connect to leader: %v\n", rn.id, err)
-		return
-	}
-	defer client.Close()
-
-	var reply struct{}
-	err = client.Call("RaftNode.RedirectCommand", command, &reply)
-	if err != nil {
-		fmt.Printf("[Node %d] Failed to redirect command to leader: %v\n", rn.id, err)
-	}
-}
-
-func (rn *RaftNode) RedirectCommand(command string, reply *struct{}) error {
-	rn.mu.Lock()
-	defer rn.mu.Unlock()
-
-	if rn.state == Leader {
-		entry := LogEntry{Term: rn.currentTerm, Command: command}
-		rn.applyCh <- entry
-		fmt.Printf("[Node %d] Received redirected command: %s\n", rn.id, command)
-	} else {
-		fmt.Printf("[Node %d] Received redirected command but not the leader\n", rn.id)
+	if cfg.id == "" {
+		log.Fatal("Missing required parameter: --node-id")
 	}
 
-	return nil
-}
-
-func (rn *RaftNode) applyCommittedLogs() {
-	rn.mu.Lock()
-	defer rn.mu.Unlock()
-
-	for rn.lastApplied < rn.commitIndex {
-		rn.lastApplied++
-		entry := rn.log[rn.lastApplied]
-		rn.applyCommand(entry.Command)
+	if cfg.raftPort == "" {
+		log.Fatal("Missing required parameter: --raft-port")
 	}
-}
 
-func (rn *RaftNode) crash() {
-	rn.mu.Lock()
-	defer rn.mu.Unlock()
-	rn.logger("Crashing...")
-	rn.state = Follower
-	rn.electionTimer.Reset(ElectionTimeout + time.Duration(rand.Intn(100))*time.Millisecond)
+	if cfg.httpPort == "" {
+		log.Fatal("Missing required parameter: --http-port")
+	}
+
+	return cfg
 }
 
 func main() {
-	rand.Seed(time.Now().UnixNano())
 
-	nodes := make([]*RaftNode, 5)
-	peers := []string{
-		"localhost:1235",
-		"localhost:1236",
-		"localhost:1237",
-		"localhost:1238",
-		"localhost:1239",
+	id := flag.String("node-id", "", "the raft id for this node")
+	port := flag.String("http-port", "", "http port for this particular raft node. Note: this is different to raft's internal port")
+	raftPort := flag.String("raft-port", "", "raft port for this particular node")
+	flag.Parse()
+
+	cfg := config{
+		id:       *id,
+		httpPort: *port,
+		raftPort: *raftPort,
 	}
 
-	for i := 0; i < 5; i++ {
-		nodes[i] = &RaftNode{
-			id:          i,
-			currentTerm: 0,
-			votedFor:    -1,
-			log:         []LogEntry{},
-			commitIndex: -1,
-			lastApplied: -1,
-			state:       Follower,
-			peers:       append(peers[:i], peers[i+1:]...),
-			store:       &KVStore{data: make(map[string]string)},
-			applyCh:     make(chan LogEntry),
-			shutdown:    make(chan struct{}),
-		}
-		nodes[i].start()
-		go nodes[i].startApplier()
+	db := &sync.Map{}
+	kf := &kvFsm{db}
+
+	dataDir := "data"
+	err := os.MkdirAll(dataDir, os.ModePerm)
+	if err != nil {
+		log.Fatalf("Could not create data directory: %s", err)
 	}
 
-	for i := 0; i < 5; i++ {
-		go nodes[i].startClient()
+	r, err := setupRaft(path.Join(dataDir, "raft"+cfg.id), cfg.id, "localhost:"+cfg.raftPort, kf)
+	if err != nil {
+		log.Fatal(err)
 	}
 
-	select {}
+	hs := httpServer{r, db}
+
+	http.HandleFunc("/set", hs.setHandler)
+	http.HandleFunc("/get", hs.getHandler)
+	http.HandleFunc("/join", hs.joinHandler)
+	http.ListenAndServe(":"+cfg.httpPort, nil)
 }
