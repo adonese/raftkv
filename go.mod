@@ -2,7 +2,10 @@ module github.com/adonese/raft
 
 go 1.21.6
 
-require github.com/hashicorp/raft v1.6.1
+require (
+	github.com/hashicorp/raft v1.6.1
+	golang.org/x/sync v0.7.0
+)
 
 require (
 	github.com/boltdb/bolt v1.3.1 // indirect

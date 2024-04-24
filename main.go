@@ -132,7 +132,7 @@ func (hs httpServer) joinHandler(w http.ResponseWriter, r *http.Request) {
 		json.NewEncoder(w).Encode(struct {
 			Error string `json:"error"`
 		}{
-			"Not the leader",
+			"not the leader",
 		})
 		http.Error(w, http.StatusText(http.StatusBadRequest), http.StatusBadRequest)
 		return
